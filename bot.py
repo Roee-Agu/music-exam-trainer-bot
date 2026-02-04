@@ -588,8 +588,7 @@ logging.basicConfig(level=logging.INFO)
 QUIZ_CHAT_ID = None
 
 # user_id -> "YYYY-MM-DD" של היום האחרון שהוא תרגל
-last_practice = {}
-
+last_practice: dict[int, str] = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,32 +606,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "היי! אני בוט החזרה למבחן בחוויה מוזיקלית 🎵\n"
         "שלחו /quiz כדי לקבל שאלה.\n"
         "אפשר גם /quiz20 למבחן של 20 שאלות.\n"
+        "ו-/quiz_all למבחן על כל החומר.\n"
         "בקבוצה: כל אחד יכול לעשות /register כדי להיכנס למעקב היומי 😉\n"
         f"(הפעלת את /start {where})"
     )
 
 
-async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = random.choice(questions)
-
-    message = await context.bot.send_poll(
-        chat_id=update.effective_chat.id,
-        question=q["question"],
-        options=q["options"],
-        type="quiz",
-        correct_option_id=q["correct_index"],
-        is_anonymous=False,
-    )
-
-    polls = context.bot_data.setdefault("polls", {})
-    poll_id = message.poll.id
-    polls[poll_id] = {
-        "question": q["question"],
-        "options": q["options"],
-        "correct_index": q["correct_index"],
-        "exam_owner": None,  # לא שייך למבחן של 20 שאלות
-        "chat_id": update.effective_chat.id,
-    }
+# ---------- עזר: טעינת ושמירת משתמשים ----------
 
 
 def load_users() -> dict[int, str]:
@@ -649,6 +629,9 @@ def save_users(users: dict[int, str]) -> None:
     data = {str(k): v for k, v in users.items()}
     with open(USERS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ---------- פקודות שימושיות ----------
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -700,19 +683,28 @@ async def shaming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def send_exam_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int):
-    exam = context.user_data["exam"]
-    idx = exam["questions_indices"][exam["current"]]
+# ---------- /quiz – שאלה אחת, במחזור על כל המאגר ----------
+
+
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    שאלה אחת מהמאגר, אבל במקום random טהור:
+    אנחנו שומרים מחזור של כל השאלות ועוברים עליהן לפני שיש חזרות.
+    """
+    # ניהול "מחזור" של כל השאלות
+    cycle = context.bot_data.get("quiz_cycle")
+    if not cycle:
+        # יוצרים ליסט עם כל האינדקסים ומערבבים
+        cycle = list(range(len(questions)))
+        random.shuffle(cycle)
+        context.bot_data["quiz_cycle"] = cycle
+
+    idx = cycle.pop()
     q = questions[idx]
 
-    total = len(exam["questions_indices"])
-    number = exam["current"] + 1  # שאלה מספר X
-
-    question_text = f"שאלה {number} מתוך {total}:\n{q['question']}"
-
     message = await context.bot.send_poll(
-        chat_id=chat_id,
-        question=question_text,
+        chat_id=update.effective_chat.id,
+        question=q["question"],
         options=q["options"],
         type="quiz",
         correct_option_id=q["correct_index"],
@@ -725,9 +717,166 @@ async def send_exam_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, c
         "question": q["question"],
         "options": q["options"],
         "correct_index": q["correct_index"],
-        "exam_owner": user_id,
-        "chat_id": chat_id,
+        "is_exam": False,  # סתם שאלה רגילה
     }
+
+
+# ---------- מבחנים גלובליים: /quiz20 ו-/quiz_all ----------
+
+
+async def send_exam_questions(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    question_indices: list[int],
+) -> None:
+    """
+    שולח את כל שאלות המבחן (20 או כל המאגר) בבת אחת לצ'אט,
+    ושומר mapping של poll_id -> מידע על השאלה + שיוך למבחן.
+    """
+    exam = context.bot_data.get("current_exam")
+    if not exam:
+        return
+
+    total = len(question_indices)
+    polls = context.bot_data.setdefault("polls", {})
+
+    for i, idx in enumerate(question_indices):
+        q = questions[idx]
+        number = i + 1
+        question_text = f"שאלה {number} מתוך {total}:\n{q['question']}"
+
+        message = await context.bot.send_poll(
+            chat_id=chat_id,
+            question=question_text,
+            options=q["options"],
+            type="quiz",
+            correct_option_id=q["correct_index"],
+            is_anonymous=False,
+        )
+
+        poll_id = message.poll.id
+        exam["poll_ids"].append(poll_id)
+
+        polls[poll_id] = {
+            "question": q["question"],
+            "options": q["options"],
+            "correct_index": q["correct_index"],
+            "is_exam": True,   # שאלה ששייכת למבחן
+        }
+
+
+async def quiz20(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    מבחן של 20 שאלות – גלובלי בצ'אט (קבוצה או פרטי):
+    - השאלות נלקחות ממאגר מחזורי כדי לכסות את כל השאלות לאורך זמן.
+    - שום שאלה לא "נזרקת": תמיד מסיימים מחזור לפני שמתחילים חדש.
+    - שולח את כל 20 השאלות בבת אחת.
+    - כל מי שיענה על כל ה-20 יקבל ציון אישי בפרטי.
+    """
+    chat = update.effective_chat
+    chat_id = chat.id
+
+    num_questions = 20
+    total_questions = len(questions)
+
+    if total_questions < num_questions:
+        await update.message.reply_text("אין מספיק שאלות בשביל 20 כרגע 🙂")
+        return
+
+    # אם כבר יש מבחן פעיל – לא נפתח עוד אחד
+    if context.bot_data.get("current_exam"):
+        await update.message.reply_text("כבר רץ מבחן כרגע. סיימו אותו לפני שמתחילים חדש 🙂")
+        return
+
+    # ===== מאגר מחזורי ל-/quiz20 =====
+    # quiz20_cycle: מה נשאר במחזור הנוכחי (פרמוטציה של כל אינדקסי השאלות).
+    cycle = context.bot_data.get("quiz20_cycle")
+
+    if not cycle:
+        # התחלה: בונים מחזור מלא של כל השאלות
+        cycle = list(range(total_questions))
+        random.shuffle(cycle)
+
+    indices: list[int] = []
+
+    # 1. קודם נשתמש *עד הסוף* במה שנשאר במחזור הנוכחי
+    while cycle and len(indices) < num_questions:
+        indices.append(cycle.pop())
+
+    # 2. אם עדיין חסרות שאלות למבחן – מתחילים מחזור חדש מלא
+    while len(indices) < num_questions:
+        new_cycle = list(range(total_questions))
+        random.shuffle(new_cycle)
+        context.bot_data["quiz20_cycle"] = new_cycle  # זה עכשיו המחזור החדש
+        cycle = new_cycle
+
+        # ממשיכים לקחת מהמחזור החדש עד שמגיעים ל-20
+        while cycle and len(indices) < num_questions:
+            indices.append(cycle.pop())
+
+    # שומרים את המצב המעודכן של המחזור (יכול להיות שנשארו בו שאלות לעתיד)
+    context.bot_data["quiz20_cycle"] = cycle
+
+    # הגדרת המבחן הנוכחי
+    context.bot_data["current_exam"] = {
+        "questions_indices": indices,
+        "poll_ids": [],
+        "total": num_questions,
+        "chat_id": chat_id,
+        "answers_by_poll": {},  # poll_id -> { user_id: is_correct }
+        "graded_users": set(),  # מי שכבר קיבל ציון
+    }
+
+    await update.message.reply_text(
+        "מתחילים מבחן של 20 שאלות! 🎧\n"
+        "כל שאלה = 5 נק׳.\n"
+        "השאלות במבחן נבחרות ממחזור שמכסה את *כל* השאלות בוודאות 📚\n"
+        "כל מי שיענה על כל ה-20 יקבל ציון אישי בפרטי 🙂"
+    )
+
+    await send_exam_questions(context, chat_id, indices)
+
+
+async def quiz_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    מבחן על כל המאגר – /quiz_all:
+    - שולח את כל השאלות בבת אחת.
+    - מי שיענה על כולן יקבל ציון אישי.
+    """
+    chat = update.effective_chat
+    chat_id = chat.id
+
+    num_questions = len(questions)
+    if num_questions == 0:
+        await update.message.reply_text("אין שאלות במאגר כרגע 🙂")
+        return
+
+    if context.bot_data.get("current_exam"):
+        await update.message.reply_text("כבר רץ מבחן כרגע. סיימו אותו לפני שמתחילים חדש 🙂")
+        return
+
+    indices = list(range(len(questions)))
+    random.shuffle(indices)
+
+    context.bot_data["current_exam"] = {
+        "questions_indices": indices,
+        "poll_ids": [],
+        "total": num_questions,
+        "chat_id": chat_id,
+        "answers_by_poll": {},
+        "graded_users": set(),
+    }
+
+    await update.message.reply_text(
+        f"מתחילים מבחן על כל החומר! 🎓\n"
+        f"יש {num_questions} שאלות.\n"
+        "כל מי שיענה על כולן יקבל ציון אישי בפרטי 🙂"
+    )
+
+    await send_exam_questions(context, chat_id, indices)
+
+
+# ---------- Poll Answer – לוגיקת תשובות ----------
 
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -760,47 +909,62 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # הודעה פרטית על נכון/לא
     if chosen_index == correct_index:
         text = f"✔️ נכון! התשובה היא: {correct_text}"
+        is_correct = True
     else:
         text = (
             "❌ לא מדויק...\n"
             f"אתה סימנת: {chosen_text}\n"
             f"התשובה הנכונה: {correct_text}"
         )
+        is_correct = False
 
     try:
         await context.bot.send_message(chat_id=user.id, text=text)
     except Exception as e:
         logging.warning(f"לא הצלחתי לשלוח הודעה פרטית ל{user.id}: {e}")
 
-    # ===== לוגיקת מבחן 20 שאלות =====
-    exam_owner = poll_info.get("exam_owner")
-    chat_id = poll_info.get("chat_id")
+    # ===== לוגיקת מבחן גלובלי (/quiz20, /quiz_all) =====
+    exam = context.bot_data.get("current_exam")
+    if not exam:
+        return
 
-    # אם הסקר הזה שייך למבחן של מישהו
-    if exam_owner == user.id:
-        exam = context.user_data.get("exam")
-        if not exam:
-            return
+    # אם הסקר הזה בכלל לא שייך למבחן הנוכחי – מתעלמים
+    if not poll_info.get("is_exam") or poll_id not in exam.get("poll_ids", []):
+        return
 
-        # עדכון סטטוס המבחן
-        if chosen_index == correct_index:
-            exam["correct"] += 1
-        exam["current"] += 1
+    answers_by_poll: dict[str, dict[int, bool]] = exam.setdefault("answers_by_poll", {})
+    poll_answers = answers_by_poll.setdefault(poll_id, {})
+    poll_answers[user.id] = is_correct
 
-        total = len(exam["questions_indices"])
+    total = exam["total"]
 
-        if exam["current"] >= total:
-            score = exam["correct"] * 5  # כל שאלה = 5 נק'
-            msg = (
-                f"סיימת את המבחן! 🎉\n"
-                f"ענית נכון על {exam['correct']} מתוך {total}.\n"
-                f"קיבלת {score}! יפה!"
-            )
+    # כמה שאלות המשתמש הזה ענה במבחן?
+    answered = 0
+    correct_count = 0
+    for p_id in exam["poll_ids"]:
+        user_answers = answers_by_poll.get(p_id, {})
+        if user.id in user_answers:
+            answered += 1
+            if user_answers[user.id]:
+                correct_count += 1
+
+    # אם המשתמש ענה על כל השאלות ועדיין לא קיבל ציון – שולחים
+    graded_users: set[int] = exam.setdefault("graded_users", set())
+    if answered == total and user.id not in graded_users:
+        score = correct_count * 5  # כל שאלה = 5 נק'
+        msg = (
+            f"סיימת את המבחן! 🎉\n"
+            f"ענית נכון על {correct_count} מתוך {total}.\n"
+            f"קיבלת {score} נקודות."
+        )
+        try:
             await context.bot.send_message(chat_id=user.id, text=msg)
-            del context.user_data["exam"]
-        else:
-            # שאלה הבאה באותו צ'אט
-            await send_exam_question(context, user.id, chat_id)
+            graded_users.add(user.id)
+        except Exception as e:
+            logging.warning(f"לא הצלחתי לשלוח ציון ל{user.id}: {e}")
+
+
+# ---------- שיימינג יומי ----------
 
 
 async def daily_shaming(context: ContextTypes.DEFAULT_TYPE):
@@ -859,44 +1023,19 @@ async def debug_shaming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-async def quiz20(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-
-    num_questions = 20
-    if len(questions) < num_questions:
-        await update.message.reply_text("אין מספיק שאלות בשביל 20 כרגע 🙂")
-        return
-
-    # אם כבר יש מבחן פעיל – לא נפתח עוד אחד
-    if "exam" in context.user_data:
-        await update.message.reply_text("כבר יש לך מבחן פעיל כרגע. סיים אותו קודם 🙂")
-        return
-
-    indices = random.sample(range(len(questions)), num_questions)
-
-    context.user_data["exam"] = {
-        "questions_indices": indices,
-        "current": 0,
-        "correct": 0,
-    }
-
-    await update.message.reply_text(
-        "מתחילים מבחן של 20 שאלות! 🎧\n"
-        "כל שאלה = 5 נק׳. בהצלחה!"
-    )
-
-    await send_exam_question(context, user.id, chat_id)
+# ---------- main ----------
 
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # טוען משתמשים רשומים מ-users.json (לא מוחק ולא משנה פורמט!)
     app.bot_data["users"] = load_users()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("quiz", quiz))
     app.add_handler(CommandHandler("quiz20", quiz20))
+    app.add_handler(CommandHandler("quiz_all", quiz_all))
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("debug_shaming", debug_shaming))
     app.add_handler(CommandHandler("myid", myid))
@@ -907,13 +1046,10 @@ def main():
     job_queue = app.job_queue
     job_queue.run_daily(
         daily_shaming,
-        time=datetime.time(hour=15, minute=0),  # 15:00 לפי השעון של המחשב שלך
+        time=datetime.time(hour=15, minute=0),  # 15:00 לפי השעון של המחשב שלך / Railway
     )
 
-
     app.run_polling()
-
-
 
 
 if __name__ == "__main__":
