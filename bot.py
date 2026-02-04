@@ -688,22 +688,30 @@ async def shaming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    שאלה אחת מהמאגר, אבל במקום random טהור:
-    אנחנו שומרים מחזור של כל השאלות ועוברים עליהן לפני שיש חזרות.
+    שאלה אחת מהמאגר, מחזורית פר-צ'אט:
+    - בכל צ'אט (פרטי או קבוצה) יש מחזור עצמאי של כל השאלות.
+    - עוברים על כל השאלות לפני שיש חזרות.
     """
-    # ניהול "מחזור" של כל השאלות
-    cycle = context.bot_data.get("quiz_cycle")
+    chat = update.effective_chat
+    chat_id = chat.id
+
+    # ניהול "מחזור" של כל השאלות פר-צ'אט
+    all_cycles = context.bot_data.setdefault("quiz_cycles", {})
+    cycle = all_cycles.get(chat_id)
+
     if not cycle:
         # יוצרים ליסט עם כל האינדקסים ומערבבים
         cycle = list(range(len(questions)))
         random.shuffle(cycle)
-        context.bot_data["quiz_cycle"] = cycle
 
+    # מוציאים שאלה אחת מהמאגרים של הצ'אט הזה
     idx = cycle.pop()
+    all_cycles[chat_id] = cycle  # שומרים חזרה את המחזור המעודכן
+
     q = questions[idx]
 
     message = await context.bot.send_poll(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         question=q["question"],
         options=q["options"],
         type="quiz",
@@ -719,6 +727,12 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "correct_index": q["correct_index"],
         "is_exam": False,  # סתם שאלה רגילה
     }
+
+    # אם המחזור נגמר – ניצור חדש בפעם הבאה שהפקודה תיקרא
+    if not cycle:
+        new_cycle = list(range(len(questions)))
+        random.shuffle(new_cycle)
+        all_cycles[chat_id] = new_cycle
 
 
 # ---------- מבחנים גלובליים: /quiz20 ו-/quiz_all ----------
